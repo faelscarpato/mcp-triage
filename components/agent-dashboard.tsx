@@ -90,7 +90,7 @@ export function AgentDashboard() {
     })
 
     try {
-      const res = await fetch("/api/mcp", {
+      const res = await fetch("/api/tools", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tool, params }),
