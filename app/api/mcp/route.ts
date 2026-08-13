@@ -1,114 +1,137 @@
-import { type NextRequest, NextResponse } from "next/server"
+import { createMcpHandler } from "mcp-handler"
+import { z } from "zod"
 import {
+  KNOWN_SKILLS,
   generateHrReport,
   parseResume,
   scoreCandidate,
-  type McpToolName,
 } from "@/lib/mcp-tools"
 
 /**
- * Servidor MCP (Model Context Protocol) para triagem de RH.
+ * Servidor MCP (Model Context Protocol) REAL para triagem de RH.
  *
- * Contrato: POST { "tool": "nome_da_ferramenta", "params": {} }
+ * Este endpoint fala o protocolo MCP nativo (JSON-RPC via Streamable HTTP)
+ * através do adaptador oficial `mcp-handler` da Vercel. Qualquer cliente MCP
+ * — Claude, Cursor, Windsurf, VS Code, etc. — pode instalar este servidor
+ * apontando para a URL pública:
  *
- * Toda a computação é determinística (regex + teoria de conjuntos).
- * A IA nunca vê o texto bruto — só recebe o JSON estruturado devolvido aqui.
+ *   https://<o-teu-dominio>/api/mcp
+ *
+ * Toda a computação é 100% determinística (regex + teoria de conjuntos): a IA
+ * nunca vê o texto bruto do currículo, apenas o JSON estruturado devolvido.
  */
 
-interface McpRequestBody {
-  tool: McpToolName
-  params: Record<string, unknown>
-}
-
-export async function POST(request: NextRequest) {
-  let body: McpRequestBody
-
-  try {
-    body = (await request.json()) as McpRequestBody
-  } catch {
-    return NextResponse.json(
-      { error: "Corpo do pedido inválido. Esperado JSON." },
-      { status: 400 },
+const handler = createMcpHandler(
+  (server) => {
+    // -----------------------------------------------------------------
+    // Tool A: parse_resume
+    // -----------------------------------------------------------------
+    server.registerTool(
+      "parse_resume",
+      {
+        title: "Analisar currículo",
+        description:
+          "Extrai nome, email e skills de um currículo em texto bruto usando regex determinístico. " +
+          "Não usa IA — devolve JSON estruturado e compacto para poupar tokens. " +
+          `Skills reconhecidas: ${KNOWN_SKILLS.join(", ")}.`,
+        inputSchema: z.object({
+          content: z
+            .string()
+            .describe("Texto bruto completo do currículo (ex.: conteúdo de um PDF)."),
+          contentType: z
+            .string()
+            .optional()
+            .describe('Tipo de conteúdo, ex.: "text/plain". Opcional.'),
+        }),
+      },
+      async ({ content, contentType }) => {
+        const result = parseResume({ content, contentType })
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+          structuredContent: result,
+        }
+      },
     )
-  }
 
-  const { tool, params } = body ?? {}
-
-  if (!tool) {
-    return NextResponse.json(
-      { error: 'Campo "tool" em falta.' },
-      { status: 400 },
-    )
-  }
-
-  try {
-    switch (tool) {
-      case "parse_resume": {
-        const result = parseResume({
-          content: String((params?.content as string) ?? ""),
-          contentType: params?.contentType as string | undefined,
-        })
-        return NextResponse.json(result)
-      }
-
-      case "score_candidate": {
-        // biome-ignore lint/suspicious/noExplicitAny: params vêm do contrato MCP genérico
+    // -----------------------------------------------------------------
+    // Tool B: score_candidate
+    // -----------------------------------------------------------------
+    server.registerTool(
+      "score_candidate",
+      {
+        title: "Pontuar candidato",
+        description:
+          "Calcula a aderência entre um candidato e uma vaga via teoria de conjuntos " +
+          "(interseção = skills correspondentes, diferença = skills em falta). " +
+          "Devolve match_score (0-100), matched_keywords, missing_keywords e um resumo.",
+        inputSchema: z.object({
+          resumeData: z
+            .object({
+              candidate_name: z.string().optional(),
+              email: z.string().optional(),
+              skills: z.array(z.string()).describe("Skills do candidato."),
+              raw_text_length: z.number().optional(),
+            })
+            .describe("Resultado devolvido por parse_resume."),
+          jobDescription: z
+            .string()
+            .describe("Descrição da vaga em texto livre."),
+        }),
+      },
+      async ({ resumeData, jobDescription }) => {
         const result = scoreCandidate({
-          resumeData: params?.resumeData as any,
-          jobDescription: String((params?.jobDescription as string) ?? ""),
+          resumeData: {
+            candidate_name: resumeData.candidate_name ?? "",
+            email: resumeData.email ?? "",
+            skills: resumeData.skills ?? [],
+            raw_text_length: resumeData.raw_text_length ?? 0,
+          },
+          jobDescription,
         })
-        return NextResponse.json(result)
-      }
-
-      case "generate_hr_report": {
-        const result = generateHrReport({
-          candidateName: String((params?.candidateName as string) ?? ""),
-          targetRole: String((params?.targetRole as string) ?? ""),
-          aiDossierContent: String((params?.aiDossierContent as string) ?? ""),
-        })
-        return NextResponse.json(result)
-      }
-
-      default:
-        return NextResponse.json(
-          { error: `Ferramenta desconhecida: "${tool}".` },
-          { status: 404 },
-        )
-    }
-  } catch (error) {
-    return NextResponse.json(
-      {
-        error: "Erro interno ao executar a ferramenta.",
-        detail: error instanceof Error ? error.message : String(error),
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+          structuredContent: result,
+        }
       },
-      { status: 500 },
     )
-  }
-}
 
-/** Descoberta de capacidades — útil para clientes MCP. */
-export async function GET() {
-  return NextResponse.json({
-    server: "hr-triage-mcp",
-    protocol: "mcp/http-json",
-    tools: [
+    // -----------------------------------------------------------------
+    // Tool C: generate_hr_report
+    // -----------------------------------------------------------------
+    server.registerTool(
+      "generate_hr_report",
       {
-        name: "parse_resume",
+        title: "Gerar parecer de RH",
         description:
-          "Extrai nome, email e skills de um currículo bruto via regex determinístico.",
-        params: ["content", "contentType"],
+          "Gera um parecer de triagem de RH formatado a partir do dossiê produzido pela IA. " +
+          "Devolve status, uma URL do relatório e o conteúdo já formatado.",
+        inputSchema: z.object({
+          candidateName: z.string().describe("Nome do candidato."),
+          targetRole: z.string().describe("Cargo/vaga alvo."),
+          aiDossierContent: z
+            .string()
+            .describe("Parecer/dossiê em texto produzido pela IA."),
+        }),
       },
-      {
-        name: "score_candidate",
-        description:
-          "Calcula aderência candidato/vaga via interseção e diferença de conjuntos.",
-        params: ["resumeData", "jobDescription"],
+      async ({ candidateName, targetRole, aiDossierContent }) => {
+        const result = generateHrReport({
+          candidateName,
+          targetRole,
+          aiDossierContent,
+        })
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+          structuredContent: result,
+        }
       },
-      {
-        name: "generate_hr_report",
-        description: "Gera (simula) um parecer de RH em PDF a partir do dossiê da IA.",
-        params: ["candidateName", "targetRole", "aiDossierContent"],
-      },
-    ],
-  })
-}
+    )
+  },
+  {
+    serverInfo: {
+      name: "hr-triage-mcp",
+      version: "1.0.0",
+    },
+  },
+)
+
+export { handler as GET, handler as POST, handler as DELETE }
